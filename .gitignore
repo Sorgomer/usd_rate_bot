@@ -1,0 +1,60 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg
+*.egg-info/
+dist/
+build/
+*.spec
+
+# --- Virtual environments ---
+venv/
+env/
+.venv/
+.env/
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+
+# --- Logs ---
+*.log
+
+# --- SQLite database ---
+*.db
+*.sqlite3
+
+# --- Environment files ---
+.env
+.env.*
+
+# --- Byte-compiled files ---
+*.bak
+*.swp
+*.tmp
+*~
+
+# --- macOS ---
+.DS_Store
+
+# --- Render ---
+# Иногда Render кладёт временные файлы в корень
+.render/
+
+# --- Cache ---
+__cache__/
+.cache/
+
+# --- PyInstaller temporary ---
+*.manifest
+*.dll
+
+# --- MyPy / PyType ---
+.mypy_cache/
+.pytype/
+
+# --- TypeScript (если вдруг появится фронтенд) ---
+node_modules/
