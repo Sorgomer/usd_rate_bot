@@ -50,7 +50,6 @@ async def on_shutdown(bot: Bot, dispatcher: Dispatcher):
 
     await scheduler.shutdown()
     await db.close()
-    await bot.delete_webhook()
     logger.info("Shutdown complete")
 
 
@@ -83,6 +82,11 @@ def create_app() -> web.Application:
     dp.shutdown.register(on_shutdown)
 
     app = web.Application()
+
+    async def health(request):
+        return web.Response(text="OK")
+    
+    app.router.add_get("/", health)
 
     # Webhook эндпоинт /webhook/{token}
     SimpleRequestHandler(
