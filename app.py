@@ -62,6 +62,17 @@ def create_app() -> web.Application:
     )
 
     dp = Dispatcher()
+
+    # --- Global error handler (logs ALL exceptions) ---
+    @dp.errors()
+    async def global_error_handler(event):
+        logging.error(
+            "Unhandled error in update:\n"
+            f"Update: {event.update}\n"
+            f"Exception: {event.exception}",
+            exc_info=True,
+        )
+
     dp["config"] = config
 
     db = Database(config.database_path)

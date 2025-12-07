@@ -20,10 +20,13 @@ async def fetch_cbr_rate(currency: str) -> tuple[float, str]:
     """
     Возвращает (курс, дата_YYYY-MM-DD) для указанной валюты.
     """
+    logger.info("Fetching CBR rate for currency=%s", currency)
     async with aiohttp.ClientSession() as session:
         async with session.get(CBR_URL) as resp:
+            logger.debug("CBR request sent, awaiting response...")
             resp.raise_for_status()
             data = await resp.json()
+            logger.debug("CBR response received successfully")
 
     date_str_raw = data.get("Date")  # вида '2025-12-06T11:30:00+03:00'
     if date_str_raw and "T" in date_str_raw:
@@ -44,6 +47,7 @@ async def fetch_cbr_rate(currency: str) -> tuple[float, str]:
 
 
 async def send_daily_rate(bot: Bot, user_id: int, currency: str):
+    logger.info("Sending daily rate to user_id=%s currency=%s", user_id, currency)
     try:
         rate, date_str = await fetch_cbr_rate(currency)
     except Exception:
@@ -54,7 +58,7 @@ async def send_daily_rate(bot: Bot, user_id: int, currency: str):
     try:
         await bot.send_message(chat_id=user_id, text=text)
     except Exception:
-        logger.exception("Failed to send daily rate to user_id=%s", user_id)
+        logger.exception("Failed to send daily rate to user_id=%s currency=%s", user_id, currency)
 
 
 class NotificationScheduler:
@@ -64,21 +68,26 @@ class NotificationScheduler:
         self.scheduler = AsyncIOScheduler(timezone=timezone.utc)
 
     async def start(self):
+        logger.info("Starting NotificationScheduler...")
         if not self.scheduler.running:
             self.scheduler.start()
         await self.reload_jobs()
 
     async def shutdown(self):
+        logger.info("Shutting down NotificationScheduler...")
         if self.scheduler.running:
             self.scheduler.shutdown(wait=False)
 
     async def reload_jobs(self):
+        logger.info("Reloading all scheduled jobs...")
         self.scheduler.remove_all_jobs()
         users = await self.db.get_all_with_notifications()
+        logger.debug("Users with notifications enabled: %s", users)
         for user in users:
             self._add_job_for_user(user)
 
     async def reschedule_for_user(self, user_id: int):
+        logger.info("Rescheduling job for user_id=%s", user_id)
         job_id = f"user_{user_id}"
         try:
             self.scheduler.remove_job(job_id)
@@ -102,6 +111,11 @@ class NotificationScheduler:
         utc_hour = int(user["utc_hour"])
         utc_minute = int(user["utc_minute"])
         currency = str(user["currency"]).upper()
+
+        logger.debug(
+            "Preparing to schedule job: user_id=%s utc_time=%02d:%02d currency=%s",
+            user_id, utc_hour, utc_minute, currency
+        )
 
         job_id = f"user_{user_id}"
 

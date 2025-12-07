@@ -17,6 +17,9 @@ from bot.keyboards.time_picker import (
 )
 from bot.scheduler import NotificationScheduler
 
+import logging
+logger = logging.getLogger(__name__)
+
 router = Router()
 
 
@@ -25,6 +28,7 @@ router = Router()
 
 @router.message(Command("settings"))
 async def cmd_settings(message: Message, db: Database):
+    logger.info("User %s opened /settings", message.from_user.id)
     user = await db.get_user(message.from_user.id)
     tz = user["timezone_utc_offset_minutes"] if user else None
     currency = user["currency"] if user else None
@@ -62,6 +66,7 @@ async def cmd_unsubscribe(
     db: Database,
     scheduler: NotificationScheduler,
 ):
+    logger.info("User %s executed /unsubscribe", message.from_user.id)
     await db.set_notifications_enabled(message.from_user.id, False)
     await scheduler.reschedule_for_user(message.from_user.id)
     await message.answer("Ежедневная рассылка отключена. ❌")
@@ -77,7 +82,9 @@ async def on_currency_chosen(
     state: FSMContext,
     db: Database,
 ):
+    logger.info("User %s selected currency=%s", callback.from_user.id, callback_data.code)
     user_id = callback.from_user.id
+    logger.debug("Saving currency for user_id=%s", user_id)
     await db.set_currency(user_id, callback_data.code)
 
     await callback.message.edit_text(
@@ -100,6 +107,8 @@ async def on_time_adjust(
     callback: CallbackQuery,
     callback_data: TimePickerCallback,
 ):
+    logger.debug("Time adjust action=%s hour=%s minute=%s user_id=%s",
+                 callback_data.action, callback_data.hour, callback_data.minute, callback.from_user.id)
     hour = callback_data.hour
     minute = callback_data.minute
 
@@ -131,6 +140,7 @@ async def on_time_confirm(
     scheduler: NotificationScheduler,
     state: FSMContext,
 ):
+    logger.info("User %s confirming time: %02d:%02d", callback.from_user.id, callback_data.hour, callback_data.minute)
     user_id = callback.from_user.id
     hour = callback_data.hour
     minute = callback_data.minute
@@ -146,6 +156,8 @@ async def on_time_confirm(
     utc_total = (local_total - offset) % (24 * 60)
     utc_hour, utc_minute = divmod(utc_total, 60)
 
+    logger.debug("Saving notification time for user_id=%s (local=%02d:%02d, utc=%02d:%02d)",
+                 user_id, hour, minute, utc_hour, utc_minute)
     await db.set_notification_time(
         user_id=user_id,
         local_hour=hour,
@@ -164,4 +176,5 @@ async def on_time_confirm(
         f"Курсы будут приходить ежедневно в {hour:02d}:{minute:02d} "
         f"(ваше локальное время)."
     )
+    logger.info("Notification time saved for user_id=%s", user_id)
     await callback.answer("Время сохранено")
