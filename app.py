@@ -112,5 +112,6 @@ def create_app() -> web.Application:
 
 if __name__ == "__main__":
     app = create_app()
-    port = int(os.getenv("PORT", "8080"))
+    port = int(os.environ["PORT"])  # Render always provides PORT
+    logger.info(f"Starting aiohttp server on port {port}")
     web.run_app(app, host="0.0.0.0", port=port)
