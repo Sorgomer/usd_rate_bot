@@ -82,28 +82,33 @@ async def geocode_city(query: str) -> tuple[float, float, str]:
 
 async def get_timezone_offset_minutes(lat: float, lon: float) -> int:
     """
-    Возвращает смещение UTC в минутах для координат lat/lon.
-
-    Использует Open-Meteo Timezone API.
+    Определяет смещение UTC в минутах через Open-Meteo (новый API).
     """
-    url = "https://api.open-meteo.com/v1/timezone"
+    logger.info("Fetching timezone for lat=%s lon=%s", lat, lon)
+
+    url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
         "longitude": lon,
+        "timezone": "auto",
+        "current": "temperature_2m"
     }
 
-    logger.info("Fetching timezone for lat=%s lon=%s", lat, lon)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=10) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params, timeout=10) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
+        if "utc_offset_seconds" not in data:
+            raise ValueError(f"No utc offset in response: {data}")
 
-    if "utc_offset_seconds" not in data:
-        raise ValueError("Не удалось получить timezone offset")
+        offset_seconds = data["utc_offset_seconds"]
+        offset_minutes = offset_seconds // 60
 
-    offset_seconds = data["utc_offset_seconds"]
-    offset_minutes = int(offset_seconds // 60)
+        logger.info("Timezone resolved: offset_minutes=%s", offset_minutes)
+        return offset_minutes
 
-    logger.info("Timezone offset fetched: %s minutes", offset_minutes)
-    return offset_minutes
+    except Exception as e:
+        logger.error("Timezone fetch failed: %s", e)
+        raise
