@@ -38,7 +38,7 @@ async def on_startup(bot: Bot, dispatcher: Dispatcher):
     await db.init_db()
     await scheduler.start()
 
-    webhook_url = f"{config.webhook_base_url}/webhook/{config.bot_token}"
+    webhook_url = f"{config.webhook_base_url}/webhook"
     await bot.set_webhook(webhook_url)
 
     logger.info("Webhook set to %s", webhook_url)
@@ -99,15 +99,18 @@ def create_app() -> web.Application:
     
     app.router.add_get("/", health)
 
-    # Webhook эндпоинт /webhook/{token}
+    # Надёжный webhook эндпоинт без токена (Render reverse proxy-safe)
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
-    ).register(app, path=f"/webhook/{config.bot_token}")
+    ).register(app, path="/webhook")
 
     # Настроить жизненный цикл приложения (startup/shutdown)
     setup_application(app, dp, bot=bot)
 
     return app
 
-app = create_app()
+if __name__ == "__main__":
+    app = create_app()
+    port = int(os.getenv("PORT", "8080"))
+    web.run_app(app, host="0.0.0.0", port=port)
