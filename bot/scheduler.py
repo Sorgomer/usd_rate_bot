@@ -18,32 +18,90 @@ CBR_URL = "https://www.cbr-xml-daily.ru/daily_json.js"
 
 async def fetch_cbr_rate(currency: str) -> tuple[float, str]:
     """
-    Возвращает (курс, дата_YYYY-MM-DD) для указанной валюты.
+    Получить курс валюты из ЦБ РФ.
+
+    Сначала пробуем JSON‑сервис cbr-xml-daily.ru.
+    Если он недоступен (timeout/DNS/SSL), используем официальный XML API ЦБ РФ.
     """
+    import asyncio
+    import xml.etree.ElementTree as ET
+
+    json_url = "https://www.cbr-xml-daily.ru/daily_json.js"
+    xml_url = "https://www.cbr.ru/scripts/XML_daily.asp"
+
     logger.info("Fetching CBR rate for currency=%s", currency)
-    async with aiohttp.ClientSession() as session:
-        async with session.get(CBR_URL) as resp:
-            logger.debug("CBR request sent, awaiting response...")
-            resp.raise_for_status()
-            data = await resp.json()
-            logger.debug("CBR response received successfully")
 
-    date_str_raw = data.get("Date")  # вида '2025-12-06T11:30:00+03:00'
-    if date_str_raw and "T" in date_str_raw:
-        date_str = date_str_raw.split("T", 1)[0]
-    else:
-        date_str = ""
+    # --- 1) Основная попытка: JSON API ---
+    for attempt in range(1, 3 + 1):
+        try:
+            logger.debug("JSON CBR attempt %s to %s", attempt, json_url)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(json_url, timeout=10) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
 
-    valute = data.get("Valute", {})
-    info = valute.get(currency.upper())
-    if not info:
-        raise ValueError(f"Валюта {currency} не найдена в ответе ЦБР")
+            # получить дату
+            raw_date = data.get("Date", "")
+            date_str = raw_date.split("T")[0] if "T" in raw_date else raw_date
 
-    value = float(info["Value"])
-    nominal = int(info.get("Nominal", 1))
-    rate = value / nominal if nominal else value
+            valute = data.get("Valute", {})
+            info = valute.get(currency.upper())
+            if not info:
+                raise KeyError(f"Currency {currency} not found in JSON")
 
-    return rate, date_str
+            value = float(info["Value"])
+            nominal = float(info.get("Nominal", 1))
+            rate = value / nominal if nominal else value
+
+            logger.info("CBR JSON rate fetched successfully for %s = %s on %s",
+                        currency, rate, date_str)
+            return rate, date_str
+
+        except Exception as e:
+            logger.warning(
+                "JSON CBR attempt %s failed for %s: %s",
+                attempt, currency, e, exc_info=True
+            )
+            await asyncio.sleep(1)
+
+    # --- 2) Fallback: XML API ЦБ ---
+    try:
+        logger.info("Falling back to XML CBR API for currency=%s", currency)
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(xml_url, timeout=10) as resp:
+                resp.raise_for_status()
+                xml_text = await resp.text()
+
+        root = ET.fromstring(xml_text)  # корень <ValCurs Date="DD.MM.YYYY">
+        xml_date = root.attrib.get("Date", "")  # '07.12.2025'
+
+        # форматируем YYYY‑MM‑DD
+        try:
+            d, m, y = xml_date.split(".")
+            date_str = f"{y}-{m}-{d}"
+        except Exception:
+            date_str = xml_date
+
+        for val in root.findall("Valute"):
+            code = val.findtext("CharCode")
+            if code == currency.upper():
+                nominal = float((val.findtext("Nominal") or "1").replace(",", "."))
+                value = float((val.findtext("Value") or "0").replace(",", "."))
+                rate = value / nominal if nominal else value
+
+                logger.info("CBR XML rate fetched successfully for %s = %s on %s",
+                            currency, rate, date_str)
+                return rate, date_str
+
+        raise RuntimeError(f"Currency {currency} not found in XML")
+
+    except Exception as e:
+        logger.exception(
+            "Fallback XML CBR API failed for %s: %s",
+            currency, e
+        )
+        raise
 
 
 async def send_daily_rate(bot: Bot, user_id: int, currency: str):
