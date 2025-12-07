@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 
 from bot.db import Database
 from bot.states import SettingsStates
-from bot.utils_timezone import TimezoneParseError, parse_timezone_offset_minutes
+from bot.utils_timezone import geocode_city, get_timezone_offset_minutes
 from bot.keyboards.currencies import get_currencies_keyboard
 
 router = Router()
@@ -22,36 +22,57 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
         "Привет! 👋\n\n"
         "Я буду присылать курсы валют ЦБ РФ.\n"
-        "Для начала укажи свой часовой пояс в формате, например:\n"
-        "`UTC+3` или `GMT-5`.",
+        "Для начала введи свой город или город и страну.\n"
+        "Например: `Москва`, `Berlin`, `New York`.",
         parse_mode="Markdown",
     )
-    await state.set_state(SettingsStates.waiting_timezone)
+    await state.set_state(SettingsStates.waiting_city)
 
 
-@router.message(SettingsStates.waiting_timezone)
+@router.message(SettingsStates.waiting_city)
 async def process_timezone(
     message: Message, state: FSMContext, db: Database
 ):
-    logger.info("User %s sent timezone input: %s", message.from_user.id, message.text)
+    logger.info("User %s sent city input: %s", message.from_user.id, message.text)
+
+    # Геокодирование города
     try:
-        offset_minutes = parse_timezone_offset_minutes(message.text)
-    except TimezoneParseError:
-        logger.warning("Failed to parse timezone from user_id=%s input='%s'", message.from_user.id, message.text)
+        lat, lon, display_name = await geocode_city(message.text)
+    except Exception as e:
+        logger.warning("Failed to geocode city for user_id=%s input='%s' error=%s",
+                       message.from_user.id, message.text, e)
         await message.answer(
-            "Не получилось распознать часовой пояс 🤔\n"
-            "Пример: `UTC+3`, `GMT-5`, `UTC+4:30`.",
+            "Не получилось найти такой город 🤔\n"
+            "Попробуй написать иначе. Например: `Москва`, `Berlin`, `New York`.",
             parse_mode="Markdown",
         )
         return
 
-    logger.debug("Parsed timezone offset_minutes=%s for user_id=%s", offset_minutes, message.from_user.id)
+    # Получение смещения UTC
+    try:
+        offset_minutes = await get_timezone_offset_minutes(lat, lon)
+    except Exception as e:
+        logger.warning("Failed to fetch timezone for user_id=%s lat=%s lon=%s error=%s",
+                       message.from_user.id, lat, lon, e)
+        await message.answer(
+            "Не удалось определить часовой пояс для этого города 😕\n"
+            "Попробуй указать другой крупный город рядом.",
+        )
+        return
+
+    logger.info(
+        "City resolved for user_id=%s: %s (lat=%s lon=%s) offset_minutes=%s",
+        message.from_user.id, display_name, lat, lon, offset_minutes
+    )
+
     await db.set_timezone(message.from_user.id, offset_minutes)
 
     await message.answer(
-        "Часовой пояс сохранён ✅\n\n"
+        f"Город определён: *{display_name}* 🌍\n"
+        f"Часовой пояс: UTC{offset_minutes/60:+.0f} сохранён ✅\n\n"
         "Теперь выбери валюту, по которой хочешь получать курс:",
+        parse_mode="Markdown",
         reply_markup=get_currencies_keyboard(),
     )
-    logger.info("Timezone saved for user_id=%s, offset_minutes=%s", message.from_user.id, offset_minutes)
+
     await state.set_state(SettingsStates.waiting_currency)

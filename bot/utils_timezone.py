@@ -1,36 +1,74 @@
-import re
+import aiohttp
+import logging
+
+"""
+Автоматическое определение часового пояса по названию города.
+
+Используем:
+1) Nominatim (OpenStreetMap) для геокодинга города → lat/lon
+2) Open-Meteo Timezone API для получения смещения UTC
+"""
+
+logger = logging.getLogger(__name__)
 
 
-class TimezoneParseError(ValueError):
-    pass
-
-
-TZ_REGEX = re.compile(
-    r"^(?:UTC|GMT)\s*([+-])\s*(\d{1,2})(?::(\d{1,2}))?$",
-    re.IGNORECASE,
-)
-
-
-def parse_timezone_offset_minutes(text: str) -> int:
+async def geocode_city(query: str) -> tuple[float, float, str]:
     """
-    Парсит строки вида: UTC+3, UTC-5, GMT+4:30 и т.п.
-    Возвращает смещение в минутах относительно UTC.
+    Определяет координаты города по текстовому запросу.
+    Возвращает: (lat, lon, display_name)
+
+    Используется Nominatim (OSM) — бесплатный и без API-ключа.
     """
-    text = (text or "").strip()
-    m = TZ_REGEX.match(text)
-    if not m:
-        raise TimezoneParseError("Неверный формат часового пояса")
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": query,
+        "format": "json",
+        "limit": 1,
+    }
 
-    sign, hours_str, minutes_str = m.groups()
-    hours = int(hours_str)
-    minutes = int(minutes_str) if minutes_str is not None else 0
+    logger.info("Geocoding city: %s", query)
 
-    if hours > 14:
-        raise TimezoneParseError("Слишком большое смещение по часам (макс. 14)")
-    if minutes < 0 or minutes >= 60:
-        raise TimezoneParseError("Минуты должны быть от 0 до 59")
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params, timeout=10, headers={"User-Agent": "TelegramBot"}) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
 
-    total = hours * 60 + minutes
-    if sign == "-":
-        total = -total
-    return total
+    if not data:
+        raise ValueError("Город не найден")
+
+    item = data[0]
+    lat = float(item["lat"])
+    lon = float(item["lon"])
+    display_name = item.get("display_name", query)
+
+    logger.info("City geocoded: %s → lat=%s lon=%s", display_name, lat, lon)
+    return lat, lon, display_name
+
+
+async def get_timezone_offset_minutes(lat: float, lon: float) -> int:
+    """
+    Возвращает смещение UTC в минутах для координат lat/lon.
+
+    Использует Open-Meteo Timezone API.
+    """
+    url = "https://api.open-meteo.com/v1/timezone"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+    }
+
+    logger.info("Fetching timezone for lat=%s lon=%s", lat, lon)
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params, timeout=10) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+    if "utc_offset_seconds" not in data:
+        raise ValueError("Не удалось получить timezone offset")
+
+    offset_seconds = data["utc_offset_seconds"]
+    offset_minutes = int(offset_seconds // 60)
+
+    logger.info("Timezone offset fetched: %s minutes", offset_minutes)
+    return offset_minutes
