@@ -9,7 +9,7 @@ from aiogram.fsm.context import FSMContext
 
 from bot.db import Database
 from bot.states import SettingsStates
-from bot.utils_timezone import geocode_city, get_timezone_offset_minutes
+from bot.utils_timezone import get_city_timezone
 from bot.keyboards.currencies import get_currencies_keyboard
 
 router = Router()
@@ -35,40 +35,30 @@ async def process_timezone(
 ):
     logger.info("User %s sent city input: %s", message.from_user.id, message.text)
 
-    # Геокодирование города
+    # Используем объединённый кэширующий метод
     try:
-        lat, lon, display_name = await geocode_city(message.text)
+        lat, lon, offset_minutes = await get_city_timezone(message.text, db)
     except Exception as e:
-        logger.warning("Failed to geocode city for user_id=%s input='%s' error=%s",
-                       message.from_user.id, message.text, e)
+        logger.warning(
+            "City timezone resolution failed for user_id=%s input='%s' error=%s",
+            message.from_user.id, message.text, e
+        )
         await message.answer(
-            "Не получилось найти такой город 🤔\n"
+            "Не удалось определить город или часовой пояс 😕\n"
             "Попробуй написать иначе. Например: `Москва`, `Berlin`, `New York`.",
             parse_mode="Markdown",
         )
         return
 
-    # Получение смещения UTC
-    try:
-        offset_minutes = await get_timezone_offset_minutes(lat, lon)
-    except Exception as e:
-        logger.warning("Failed to fetch timezone for user_id=%s lat=%s lon=%s error=%s",
-                       message.from_user.id, lat, lon, e)
-        await message.answer(
-            "Не удалось определить часовой пояс для этого города 😕\n"
-            "Попробуй указать другой крупный город рядом.",
-        )
-        return
-
     logger.info(
-        "City resolved for user_id=%s: %s (lat=%s lon=%s) offset_minutes=%s",
-        message.from_user.id, display_name, lat, lon, offset_minutes
+        "City resolved for user_id=%s: lat=%s lon=%s offset_minutes=%s",
+        message.from_user.id, lat, lon, offset_minutes
     )
 
     await db.set_timezone(message.from_user.id, offset_minutes)
 
     await message.answer(
-        f"Город определён: *{display_name}* 🌍\n"
+        f"Город определён: *{message.text}* 🌍\n"
         f"Часовой пояс: UTC{offset_minutes/60:+.0f} сохранён ✅\n\n"
         "Теперь выбери валюту, по которой хочешь получать курс:",
         parse_mode="Markdown",

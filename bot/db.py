@@ -40,6 +40,18 @@ class Database:
             """
         )
         await self._conn.commit()
+        await self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS city_cache (
+                city TEXT PRIMARY KEY,
+                lat REAL NOT NULL,
+                lon REAL NOT NULL,
+                offset_minutes INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        await self._conn.commit()
 
     async def _ensure_user_row(self, user_id: int):
         logger.debug(f"Ensuring user row exists: user_id={user_id}")
@@ -192,6 +204,41 @@ class Database:
                 }
             )
         return users
+
+    async def cache_city(self, city: str, lat: float, lon: float, offset: int):
+        """
+        Stores or updates city timezone cache.
+        """
+        import time
+        ts = int(time.time())
+        logger.info(f"Caching city={city} lat={lat} lon={lon} offset={offset}")
+        await self.connect()
+        await self._conn.execute(
+            """
+            INSERT INTO city_cache(city, lat, lon, offset_minutes, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(city) DO UPDATE SET
+                lat=excluded.lat,
+                lon=excluded.lon,
+                offset_minutes=excluded.offset_minutes,
+                updated_at=excluded.updated_at
+            """,
+            (city.lower(), lat, lon, offset, ts),
+        )
+        await self._conn.commit()
+
+    async def get_cached_city(self, city: str):
+        """
+        Returns (lat, lon, offset, updated_at) or None.
+        """
+        await self.connect()
+        cursor = await self._conn.execute(
+            "SELECT lat, lon, offset_minutes, updated_at FROM city_cache WHERE city = ?",
+            (city.lower(),),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row
 
     async def close(self):
         if self._conn is not None:

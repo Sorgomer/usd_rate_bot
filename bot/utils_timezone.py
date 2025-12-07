@@ -11,6 +11,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+import time
+
+# In-memory TTL cache for city timezone data
+CITY_CACHE_RAM = {}  # { city_lower: {"lat": float, "lon": float, "offset": int, "updated_at": int} }
+CACHE_TTL = 86400  # 24 hours
+
 
 async def geocode_city(query: str) -> tuple[float, float, str]:
     """
@@ -112,3 +118,53 @@ async def get_timezone_offset_minutes(lat: float, lon: float) -> int:
     except Exception as e:
         logger.error("Timezone fetch failed: %s", e)
         raise
+
+
+async def get_city_timezone(city: str, db):
+    """
+    Унифицированный метод:
+    1) Проверяет RAM-кэш
+    2) Проверяет SQLite-кэш
+    3) Делает API-запросы (геокодер + timezone)
+    4) Сохраняет результат в оба кэша
+    """
+    city_key = city.lower()
+    now = time.time()
+
+    # 1) RAM cache
+    if city_key in CITY_CACHE_RAM:
+        c = CITY_CACHE_RAM[city_key]
+        if now - c["updated_at"] < CACHE_TTL:
+            logger.info(f"[CACHE RAM] Hit for: {city}")
+            return c["lat"], c["lon"], c["offset"]
+
+    # 2) SQLite cache
+    row = await db.get_cached_city(city_key)
+    if row:
+        lat, lon, offset, ts = row
+        if now - ts < CACHE_TTL:
+            logger.info(f"[CACHE SQLite] Hit for: {city}")
+
+            CITY_CACHE_RAM[city_key] = {
+                "lat": lat,
+                "lon": lon,
+                "offset": offset,
+                "updated_at": ts,
+            }
+            return lat, lon, offset
+
+    # 3) Full API lookup
+    lat, lon, _ = await geocode_city(city)
+    offset = await get_timezone_offset_minutes(lat, lon)
+
+    # Save into caches
+    CITY_CACHE_RAM[city_key] = {
+        "lat": lat,
+        "lon": lon,
+        "offset": offset,
+        "updated_at": int(now),
+    }
+    await db.cache_city(city_key, lat, lon, offset)
+
+    logger.info(f"[CACHE WRITE] Stored cache for {city}")
+    return lat, lon, offset
