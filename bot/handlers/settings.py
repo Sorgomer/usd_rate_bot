@@ -15,6 +15,7 @@ from bot.keyboards.time_picker import (
     TimePickerCallback,
     ALLOWED_MINUTES,
 )
+from bot.scheduler import fetch_cbr_rate
 from bot.scheduler import NotificationScheduler
 
 import logging
@@ -178,3 +179,32 @@ async def on_time_confirm(
     )
     logger.info("Notification time saved for user_id=%s", user_id)
     await callback.answer("Время сохранено")
+
+
+# ---------- /now : вручную получить курс валюты ----------
+
+@router.message(Command("now"))
+async def cmd_now(message: Message, db: Database):
+    user = await db.get_user(message.from_user.id)
+    if not user or not user.get("currency"):
+        await message.answer("Сначала настройте бота через /start (часовой пояс и валюту).")
+        return
+
+    currency = user["currency"]
+    try:
+        rate, date_str = await fetch_cbr_rate(currency)
+    except Exception:
+        logger.exception("Failed to fetch CBR rate for /now, user_id=%s", message.from_user.id)
+        await message.answer("Не удалось получить курс ЦБ РФ, попробуйте позже.")
+        return
+
+    text = f"{currency} → {rate:.2f} ₽\nДата: {date_str}"
+    await message.answer(text)
+
+
+# ---------- /debug_jobs : показать запланированные задачи APScheduler ----------
+
+@router.message(Command("debug_jobs"))
+async def cmd_debug_jobs(message: Message, scheduler: NotificationScheduler):
+    text = await scheduler.debug_jobs()
+    await message.answer(f"Текущие задачи:\n{text}")
