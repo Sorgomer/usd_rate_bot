@@ -52,6 +52,17 @@ class Database:
             """
         )
         await self._conn.commit()
+        await self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rates (
+                date TEXT,
+                currency TEXT,
+                rate REAL,
+                PRIMARY KEY(date, currency)
+            )
+            """
+        )
+        await self._conn.commit()
 
     async def _ensure_user_row(self, user_id: int):
         logger.debug(f"Ensuring user row exists: user_id={user_id}")
@@ -239,6 +250,51 @@ class Database:
         row = await cursor.fetchone()
         await cursor.close()
         return row
+
+    async def save_rate(self, date: str, currency: str, rate: float):
+        logger.info(f"Saving rate for date={date} currency={currency} rate={rate}")
+        await self.connect()
+        await self._conn.execute(
+            """
+            INSERT INTO rates(date, currency, rate)
+            VALUES (?, ?, ?)
+            ON CONFLICT(date, currency) DO UPDATE SET
+                rate=excluded.rate
+            """,
+            (date, currency, rate),
+        )
+        await self._conn.commit()
+
+    async def get_rate(self, date: str, currency: str) -> Optional[float]:
+        logger.debug(f"Getting rate for date={date} currency={currency}")
+        await self.connect()
+        cursor = await self._conn.execute(
+            "SELECT rate FROM rates WHERE date = ? AND currency = ?",
+            (date, currency),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        return row[0]
+
+    async def get_latest_rate(self, currency: str) -> Optional[float]:
+        logger.debug(f"Getting latest rate for currency={currency}")
+        await self.connect()
+        cursor = await self._conn.execute(
+            """
+            SELECT rate FROM rates
+            WHERE currency = ?
+            ORDER BY date DESC
+            LIMIT 1
+            """,
+            (currency,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        return row[0]
 
     async def close(self):
         if self._conn is not None:
