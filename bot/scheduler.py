@@ -26,6 +26,7 @@ async def fetch_cbr_rate(currency: str, db: Database) -> dict:
     Если неудачно, пытаемся получить из архива XML за вчера.
     Возвращаем словарь с ключами: rate, date, stale (bool), change_arrow (str).
     """
+    stale_json_fallback: dict | None = None
     import xml.etree.ElementTree as ET
 
     json_url_today = "https://www.cbr-xml-daily.ru/daily_json.js"
@@ -126,7 +127,16 @@ async def fetch_cbr_rate(currency: str, db: Database) -> dict:
             rate = value / nominal if nominal else value
             raw_date = data.get("Date", "")
             date_str = raw_date.split("T")[0] if "T" in raw_date else raw_date
-            stale = False
+
+            # Определяем, не устарели ли данные (бывает, что daily_json.js отдаёт вчерашнюю дату)
+            try:
+                parsed_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                today = date.today()
+                stale = parsed_date < today
+            except Exception:
+                # Если не удалось распарсить дату, считаем данные свежими, но логируем
+                logger.warning("Failed to parse CBR JSON date: %s", date_str)
+                stale = False
 
             previous_rate = await db.get_previous_rate(currency.upper())
             if previous_rate is None:
@@ -134,14 +144,27 @@ async def fetch_cbr_rate(currency: str, db: Database) -> dict:
             else:
                 change_arrow = _calculate_arrow(rate, previous_rate)
 
-            await db.save_rate(currency.upper(), rate, date_str)
+            await db.save_rate(date_str, currency.upper(), rate)
 
-            return {
+            result_dict = {
                 "rate": rate,
                 "date": date_str,
                 "stale": stale,
                 "change_arrow": change_arrow,
             }
+
+            if not stale:
+                # Свежие данные за сегодня — сразу возвращаем
+                return result_dict
+            else:
+                # JSON today вернул устаревшую дату — запомним как запасной вариант
+                logger.warning(
+                    "CBR JSON today returned stale date %s for currency %s, "
+                    "trying archive fallback.",
+                    date_str,
+                    currency,
+                )
+                stale_json_fallback = result_dict
 
     # 2) JSON archive (вчера)
     yesterday = date.today() - timedelta(days=1)
@@ -155,6 +178,7 @@ async def fetch_cbr_rate(currency: str, db: Database) -> dict:
             rate = value / nominal if nominal else value
             raw_date = data.get("Date", "")
             date_str = raw_date.split("T")[0] if "T" in raw_date else raw_date
+            # Архивный JSON гарантированно не за сегодня
             stale = True
 
             previous_rate = await db.get_previous_rate(currency.upper())
@@ -163,7 +187,7 @@ async def fetch_cbr_rate(currency: str, db: Database) -> dict:
             else:
                 change_arrow = _calculate_arrow(rate, previous_rate)
 
-            await db.save_rate(currency.upper(), rate, date_str)
+            await db.save_rate(date_str, currency.upper(), rate)
 
             return {
                 "rate": rate,
@@ -176,13 +200,22 @@ async def fetch_cbr_rate(currency: str, db: Database) -> dict:
     xml_date, root = await _get_xml_today()
     if root is not None:
         date_str = parse_xml_date(xml_date) if xml_date else ""
+
+        # Проверяем, не устарели ли данные XML-дневного курса
+        try:
+            parsed_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            today = date.today()
+            stale = parsed_date < today
+        except Exception:
+            logger.warning("Failed to parse CBR XML date: %s", date_str)
+            stale = False
+
         for val in root.findall("Valute"):
             code = val.findtext("CharCode")
             if code == currency.upper():
                 nominal = float((val.findtext("Nominal") or "1").replace(",", "."))
                 value = float((val.findtext("Value") or "0").replace(",", "."))
                 rate = value / nominal if nominal else value
-                stale = False
 
                 previous_rate = await db.get_previous_rate(currency.upper())
                 if previous_rate is None:
@@ -190,7 +223,7 @@ async def fetch_cbr_rate(currency: str, db: Database) -> dict:
                 else:
                     change_arrow = _calculate_arrow(rate, previous_rate)
 
-                await db.save_rate(currency.upper(), rate, date_str)
+                await db.save_rate(date_str, currency.upper(), rate)
 
                 return {
                     "rate": rate,
@@ -209,6 +242,7 @@ async def fetch_cbr_rate(currency: str, db: Database) -> dict:
                 nominal = float((val.findtext("Nominal") or "1").replace(",", "."))
                 value = float((val.findtext("Value") or "0").replace(",", "."))
                 rate = value / nominal if nominal else value
+                # Архивный XML гарантированно не за сегодня
                 stale = True
 
                 previous_rate = await db.get_previous_rate(currency.upper())
@@ -217,7 +251,7 @@ async def fetch_cbr_rate(currency: str, db: Database) -> dict:
                 else:
                     change_arrow = _calculate_arrow(rate, previous_rate)
 
-                await db.save_rate(currency.upper(), rate, date_str)
+                await db.save_rate(date_str, currency.upper(), rate)
 
                 return {
                     "rate": rate,
@@ -226,7 +260,15 @@ async def fetch_cbr_rate(currency: str, db: Database) -> dict:
                     "change_arrow": change_arrow,
                 }
 
-    # If all attempts failed, raise exception
+    # If all attempts failed, но у нас есть устаревший JSON-today — используем его
+    if stale_json_fallback is not None:
+        logger.warning(
+            "Using stale JSON-today CBR rate for %s as last-resort fallback.",
+            currency,
+        )
+        return stale_json_fallback
+
+    # If all attempts really failed, raise exception
     raise RuntimeError(
         f"Failed to fetch CBR rate for currency {currency} with all fallbacks."
     )
@@ -245,11 +287,17 @@ async def send_daily_rate(bot: Bot, user_id: int, currency: str, db: Database):
     stale = result["stale"]
     arrow = result["change_arrow"]
 
-    stale_text = " (данные могут быть устаревшими)" if stale else ""
-    text = (
-        f"{currency.upper()} → {rate:.2f} ₽ {arrow}\n"
-        f"Дата: {date_str}{stale_text}"
-    )
+    lines = []
+
+    if stale:
+        lines.append(f"⚠️ Курс может быть не за сегодня (дата: {date_str})")
+
+    lines.append(f"💵 {currency.upper()}")
+    lines.append(f"Курс: {rate:.2f} ₽   {arrow}")
+
+    lines.append(f"Дата курса: {date_str}")
+
+    text = "\n".join(lines)
 
     try:
         await bot.send_message(chat_id=user_id, text=text)
@@ -272,6 +320,7 @@ class NotificationScheduler:
         if not self.scheduler.running:
             self.scheduler.start()
         await self.reload_jobs()
+
 
     async def shutdown(self):
         logger.info("Shutting down NotificationScheduler...")

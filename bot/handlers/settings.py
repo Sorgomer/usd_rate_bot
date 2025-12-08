@@ -16,7 +16,6 @@ from bot.keyboards.time_picker import (
     ALLOWED_MINUTES,
 )
 from bot.scheduler import fetch_cbr_rate
-from bot.scheduler import NotificationScheduler
 
 import logging
 logger = logging.getLogger(__name__)
@@ -65,7 +64,7 @@ async def cmd_settings(message: Message, db: Database):
 async def cmd_unsubscribe(
     message: Message,
     db: Database,
-    scheduler: NotificationScheduler,
+    scheduler,
 ):
     logger.info("User %s executed /unsubscribe", message.from_user.id)
     await db.set_notifications_enabled(message.from_user.id, False)
@@ -138,7 +137,7 @@ async def on_time_confirm(
     callback: CallbackQuery,
     callback_data: TimePickerCallback,
     db: Database,
-    scheduler: NotificationScheduler,
+    scheduler,
     state: FSMContext,
 ):
     logger.info("User %s confirming time: %02d:%02d", callback.from_user.id, callback_data.hour, callback_data.minute)
@@ -192,19 +191,19 @@ async def cmd_now(message: Message, db: Database):
 
     currency = user["currency"]
     try:
-        rate, date_str = await fetch_cbr_rate(currency)
+        result = await fetch_cbr_rate(currency, db)
+        rate = result["rate"]
+        date_str = result["date"]
+        stale = result["stale"]
+        arrow = result["change_arrow"]
     except Exception:
         logger.exception("Failed to fetch CBR rate for /now, user_id=%s", message.from_user.id)
         await message.answer("Не удалось получить курс ЦБ РФ, попробуйте позже.")
         return
 
-    text = f"{currency} → {rate:.2f} ₽\nДата: {date_str}"
+    stale_text = " (данные могут быть устаревшими)" if stale else ""
+    text = (
+        f"{currency.upper()} → {rate:.2f} ₽ {arrow}\n"
+        f"Дата: {date_str}{stale_text}"
+    )
     await message.answer(text)
-
-
-# ---------- /debug_jobs : показать запланированные задачи APScheduler ----------
-
-@router.message(Command("debug_jobs"))
-async def cmd_debug_jobs(message: Message, scheduler: NotificationScheduler):
-    text = await scheduler.debug_jobs()
-    await message.answer(f"Текущие задачи:\n{text}")

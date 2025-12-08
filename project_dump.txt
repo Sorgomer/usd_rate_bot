@@ -1,0 +1,1654 @@
+
+
+================================================================================
+FILE: ./render.yaml
+================================================================================
+
+services:
+  - type: web
+    name: USD_rate_bot
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python app.py"
+    envVars:
+      - key: BOT_TOKEN
+        sync: false          # задаёшь в панели Render
+      - key: WEBHOOK_BASE_URL
+        value: "https://cbr-course-bot.onrender.com"  # поменяй на свой URL
+      - key: DATABASE_PATH
+        value: "bot.db"
+
+================================================================================
+FILE: ./.DS_Store
+================================================================================
+
+[UNREADABLE FILE: 'utf-8' codec can't decode byte 0xb7 in position 1063: invalid start byte]
+
+================================================================================
+FILE: ./requirements.txt
+================================================================================
+
+aiogram==3.22.0
+aiohttp==3.10.10
+aiosqlite==0.20.0
+APScheduler==3.10.4
+python-dotenv==1.0.1
+
+================================================================================
+FILE: ./dump_project.py
+================================================================================
+
+import os
+
+OUTPUT_FILE = "project_dump.txt"
+
+# игнорируемые папки
+IGNORE_DIRS = {
+    "__pycache__", ".git", ".idea", ".vscode",
+    "env", "venv", ".venv", "node_modules",
+}
+
+# игнорируемые расширения
+IGNORE_EXT = {
+    ".pyc", ".db", ".sqlite3", ".log",
+    ".jpg", ".jpeg", ".png", ".gif",
+    ".mp4", ".mp3", ".zip", ".tar", ".gz",
+}
+
+
+def should_ignore(path: str) -> bool:
+    if any(part in IGNORE_DIRS for part in path.split(os.sep)):
+        return True
+    _, ext = os.path.splitext(path)
+    return ext in IGNORE_EXT
+
+
+def dump_file(path: str, output):
+    output.write("\n\n" + "=" * 80 + "\n")
+    output.write(f"FILE: {path}\n")
+    output.write("=" * 80 + "\n\n")
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            output.write(f.read())
+    except Exception as e:
+        output.write(f"[UNREADABLE FILE: {e}]")
+
+
+def main():
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as output:
+        for root, dirs, files in os.walk("."):
+            dirs[:] = [d for d in dirs if d not in IGNORE_DIRS]
+
+            for file in files:
+                full_path = os.path.join(root, file)
+                if should_ignore(full_path):
+                    continue
+                dump_file(full_path, output)
+
+    print(f"Готово! Все файлы собраны в {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+FILE: ./.gitignore
+================================================================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg
+*.egg-info/
+dist/
+build/
+*.spec
+
+# --- Virtual environments ---
+venv/
+env/
+.venv/
+.env/
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+
+# --- Logs ---
+*.log
+
+# --- SQLite database ---
+*.db
+*.sqlite3
+
+# --- Environment files ---
+.env
+.env.*
+
+# --- Byte-compiled files ---
+*.bak
+*.swp
+*.tmp
+*~
+
+# --- macOS ---
+.DS_Store
+
+# --- Render ---
+# Иногда Render кладёт временные файлы в корень
+.render/
+
+# --- Cache ---
+__cache__/
+.cache/
+
+# --- PyInstaller temporary ---
+*.manifest
+*.dll
+
+# --- MyPy / PyType ---
+.mypy_cache/
+.pytype/
+
+# --- TypeScript (если вдруг появится фронтенд) ---
+node_modules/
+
+================================================================================
+FILE: ./project_dump.txt
+================================================================================
+
+
+
+================================================================================
+FILE: ./app.py
+================================================================================
+
+import asyncio
+import logging
+import os
+
+from aiohttp import web
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.webhook.aiohttp_server import (
+    SimpleRequestHandler,
+    setup_application,
+)
+
+from bot.config import load_config
+from bot.db import Database
+from bot.scheduler import NotificationScheduler
+from bot.middlewares import LoggingMiddleware
+from bot.handlers import start as start_handlers
+from bot.handlers import settings as settings_handlers
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+async def on_startup(bot: Bot, dispatcher: Dispatcher):
+    """
+    Вызывается aiogram при старте (через setup_application).
+    """
+    config = dispatcher["config"]
+    db: Database = dispatcher["db"]
+    scheduler: NotificationScheduler = dispatcher["scheduler"]
+
+    await db.init_db()
+    await scheduler.start()
+
+    webhook_url = f"{config.webhook_base_url}/webhook"
+    await bot.set_webhook(webhook_url)
+
+    logger.info("Webhook set to %s", webhook_url)
+
+
+async def on_shutdown(bot: Bot, dispatcher: Dispatcher):
+    scheduler: NotificationScheduler = dispatcher["scheduler"]
+    db: Database = dispatcher["db"]
+
+    await scheduler.shutdown()
+    await db.close()
+    logger.info("Shutdown complete")
+
+
+def create_app() -> web.Application:
+    config = load_config()
+
+    bot = Bot(
+        token=config.bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+
+    dp = Dispatcher()
+
+    # --- Global error handler (logs ALL exceptions) ---
+    @dp.errors()
+    async def global_error_handler(event):
+        logging.error(
+            "Unhandled error in update:\n"
+            f"Update: {event.update}\n"
+            f"Exception: {event.exception}",
+            exc_info=True,
+        )
+
+    dp["config"] = config
+
+    db = Database(config.database_path)
+    scheduler = NotificationScheduler(db=db, bot=bot)
+
+    dp["db"] = db
+    dp["scheduler"] = scheduler
+
+    # Роутеры
+    dp.include_router(start_handlers.router)
+    dp.include_router(settings_handlers.router)
+
+    # Middleware логирования
+    dp.update.middleware(LoggingMiddleware())
+
+    # Хуки старта/остановки
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
+    app = web.Application()
+
+    async def health(request):
+        return web.Response(text="OK")
+    
+    app.router.add_get("/", health)
+
+    # Надёжный webhook эндпоинт без токена (Render reverse proxy-safe)
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    ).register(app, path="/webhook")
+
+    # Настроить жизненный цикл приложения (startup/shutdown)
+    setup_application(app, dp, bot=bot)
+
+    return app
+
+if __name__ == "__main__":
+    app = create_app()
+    port = int(os.environ["PORT"])  # Render always provides PORT
+    logger.info(f"Starting aiohttp server on port {port}")
+    web.run_app(app, host="0.0.0.0", port=port)
+
+================================================================================
+FILE: ./bot/db.py
+================================================================================
+
+from __future__ import annotations
+
+import aiosqlite
+from typing import Optional, Dict, Any, List
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class Database:
+    def __init__(self, path: str):
+        self._path = path
+        self._conn: Optional[aiosqlite.Connection] = None
+
+    async def connect(self):
+        logger.info("DB connect requested")
+        if self._conn is None:
+            self._conn = await aiosqlite.connect(self._path)
+            logger.info(f"Connected to SQLite DB at {self._path}")
+            await self._conn.execute("PRAGMA foreign_keys = ON")
+            await self._conn.execute("PRAGMA journal_mode = WAL")
+            await self._conn.execute("PRAGMA synchronous = NORMAL")
+            await self._conn.commit()
+
+    async def init_db(self):
+        await self.connect()
+        await self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users_settings (
+                user_id INTEGER PRIMARY KEY,
+                timezone_utc_offset_minutes INTEGER,
+                currency TEXT,
+                local_hour INTEGER,
+                local_minute INTEGER,
+                utc_hour INTEGER,
+                utc_minute INTEGER,
+                notification_enabled INTEGER DEFAULT 0
+            )
+            """
+        )
+        await self._conn.commit()
+        await self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS city_cache (
+                city TEXT PRIMARY KEY,
+                lat REAL NOT NULL,
+                lon REAL NOT NULL,
+                offset_minutes INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        await self._conn.commit()
+        await self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rates (
+                date TEXT,
+                currency TEXT,
+                rate REAL,
+                PRIMARY KEY(date, currency)
+            )
+            """
+        )
+        await self._conn.commit()
+
+    async def _ensure_user_row(self, user_id: int):
+        logger.debug(f"Ensuring user row exists: user_id={user_id}")
+        await self.connect()
+        cursor = await self._conn.execute(
+            "SELECT 1 FROM users_settings WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            await self._conn.execute(
+                "INSERT INTO users_settings (user_id, notification_enabled) VALUES (?, 0)",
+                (user_id,),
+            )
+            await self._conn.commit()
+
+    async def set_timezone(self, user_id: int, offset_minutes: int):
+        logger.info(f"Setting timezone for user_id={user_id} offset={offset_minutes}")
+        await self._ensure_user_row(user_id)
+        await self._conn.execute(
+            "UPDATE users_settings SET timezone_utc_offset_minutes = ? WHERE user_id = ?",
+            (offset_minutes, user_id),
+        )
+        await self._conn.commit()
+
+    async def set_currency(self, user_id: int, currency: str):
+        logger.info(f"Setting currency for user_id={user_id} currency={currency}")
+        await self._ensure_user_row(user_id)
+        await self._conn.execute(
+            "UPDATE users_settings SET currency = ? WHERE user_id = ?",
+            (currency, user_id),
+        )
+        await self._conn.commit()
+
+    async def set_notification_time(
+        self,
+        user_id: int,
+        local_hour: int,
+        local_minute: int,
+        utc_hour: int,
+        utc_minute: int,
+        enabled: bool = True,
+    ):
+        logger.info(
+            f"Setting notification time for user_id={user_id} "
+            f"local={local_hour}:{local_minute} utc={utc_hour}:{utc_minute}"
+        )
+        await self._ensure_user_row(user_id)
+        await self._conn.execute(
+            """
+            UPDATE users_settings
+            SET local_hour = ?, local_minute = ?, utc_hour = ?, utc_minute = ?, notification_enabled = ?
+            WHERE user_id = ?
+            """,
+            (local_hour, local_minute, utc_hour, utc_minute, int(enabled), user_id),
+        )
+        await self._conn.commit()
+
+    async def set_notifications_enabled(self, user_id: int, enabled: bool):
+        logger.info(f"Setting notifications_enabled={enabled} for user_id={user_id}")
+        await self._ensure_user_row(user_id)
+        await self._conn.execute(
+            "UPDATE users_settings SET notification_enabled = ? WHERE user_id = ?",
+            (int(enabled), user_id),
+        )
+        await self._conn.commit()
+
+    async def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+        logger.debug(f"Fetching user_id={user_id}")
+        await self.connect()
+        cursor = await self._conn.execute(
+            """
+            SELECT user_id, timezone_utc_offset_minutes, currency,
+                   local_hour, local_minute, utc_hour, utc_minute,
+                   notification_enabled
+            FROM users_settings
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+
+        if row is None:
+            return None
+
+        (
+            user_id,
+            offset,
+            currency,
+            local_hour,
+            local_minute,
+            utc_hour,
+            utc_minute,
+            enabled,
+        ) = row
+
+        return {
+            "user_id": user_id,
+            "timezone_utc_offset_minutes": offset,
+            "currency": currency,
+            "local_hour": local_hour,
+            "local_minute": local_minute,
+            "utc_hour": utc_hour,
+            "utc_minute": utc_minute,
+            "notification_enabled": bool(enabled),
+        }
+
+    async def get_all_with_notifications(self) -> List[Dict[str, Any]]:
+        logger.debug("Fetching all users with enabled notifications")
+        await self.connect()
+        cursor = await self._conn.execute(
+            """
+            SELECT user_id, timezone_utc_offset_minutes, currency,
+                   local_hour, local_minute, utc_hour, utc_minute,
+                   notification_enabled
+            FROM users_settings
+            WHERE notification_enabled = 1
+              AND utc_hour IS NOT NULL
+              AND utc_minute IS NOT NULL
+              AND currency IS NOT NULL
+            """
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+
+        users = []
+        for row in rows:
+            (
+                user_id,
+                offset,
+                currency,
+                local_hour,
+                local_minute,
+                utc_hour,
+                utc_minute,
+                enabled,
+            ) = row
+            users.append(
+                {
+                    "user_id": user_id,
+                    "timezone_utc_offset_minutes": offset,
+                    "currency": currency,
+                    "local_hour": local_hour,
+                    "local_minute": local_minute,
+                    "utc_hour": utc_hour,
+                    "utc_minute": utc_minute,
+                    "notification_enabled": bool(enabled),
+                }
+            )
+        return users
+
+    async def cache_city(self, city: str, lat: float, lon: float, offset: int):
+        """
+        Stores or updates city timezone cache.
+        """
+        import time
+        ts = int(time.time())
+        logger.info(f"Caching city={city} lat={lat} lon={lon} offset={offset}")
+        await self.connect()
+        await self._conn.execute(
+            """
+            INSERT INTO city_cache(city, lat, lon, offset_minutes, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(city) DO UPDATE SET
+                lat=excluded.lat,
+                lon=excluded.lon,
+                offset_minutes=excluded.offset_minutes,
+                updated_at=excluded.updated_at
+            """,
+            (city.lower(), lat, lon, offset, ts),
+        )
+        await self._conn.commit()
+
+    async def get_cached_city(self, city: str):
+        """
+        Returns (lat, lon, offset, updated_at) or None.
+        """
+        await self.connect()
+        cursor = await self._conn.execute(
+            "SELECT lat, lon, offset_minutes, updated_at FROM city_cache WHERE city = ?",
+            (city.lower(),),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row
+
+    async def save_rate(self, date: str, currency: str, rate: float):
+        logger.info(f"Saving rate for date={date} currency={currency} rate={rate}")
+        await self.connect()
+        await self._conn.execute(
+            """
+            INSERT INTO rates(date, currency, rate)
+            VALUES (?, ?, ?)
+            ON CONFLICT(date, currency) DO UPDATE SET
+                rate=excluded.rate
+            """,
+            (date, currency, rate),
+        )
+        await self._conn.commit()
+
+    async def get_rate(self, date: str, currency: str) -> Optional[float]:
+        logger.debug(f"Getting rate for date={date} currency={currency}")
+        await self.connect()
+        cursor = await self._conn.execute(
+            "SELECT rate FROM rates WHERE date = ? AND currency = ?",
+            (date, currency),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        return row[0]
+
+    async def get_latest_rate(self, currency: str) -> Optional[float]:
+        logger.debug(f"Getting latest rate for currency={currency}")
+        await self.connect()
+        cursor = await self._conn.execute(
+            """
+            SELECT rate FROM rates
+            WHERE currency = ?
+            ORDER BY date DESC
+            LIMIT 1
+            """,
+            (currency,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return None
+        return row[0]
+
+    async def get_previous_rate(self, currency: str) -> Optional[float]:
+        """
+        Возвращает предыдущий сохранённый курс (не последний).
+        Используется для расчёта стрелочки изменения.
+        """
+        await self.connect()
+        cursor = await self._conn.execute(
+            """
+            SELECT rate FROM rates
+            WHERE currency = ?
+            ORDER BY date DESC
+            LIMIT 1 OFFSET 1
+            """,
+            (currency,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row:
+            return row[0]
+        return None
+
+    async def close(self):
+        if self._conn is not None:
+            await self._conn.close()
+            self._conn = None
+
+================================================================================
+FILE: ./bot/.DS_Store
+================================================================================
+
+[UNREADABLE FILE: 'utf-8' codec can't decode byte 0x80 in position 3131: invalid start byte]
+
+================================================================================
+FILE: ./bot/config.py
+================================================================================
+
+import os
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+@dataclass
+class Config:
+    bot_token: str
+    webhook_base_url: str   # https://your-service.onrender.com
+    database_path: str = "bot.db"
+
+
+def load_config() -> Config:
+    token = os.getenv("BOT_TOKEN", "")
+    base_url = os.getenv("WEBHOOK_BASE_URL", "")
+    if not token:
+        raise RuntimeError("BOT_TOKEN env var is required")
+    if not base_url:
+        raise RuntimeError("WEBHOOK_BASE_URL env var is required")
+
+    return Config(
+        bot_token=token,
+        webhook_base_url=base_url.rstrip("/"),
+        database_path=os.getenv("DATABASE_PATH", "bot.db"),
+    )
+
+================================================================================
+FILE: ./bot/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./bot/utils_timezone.py
+================================================================================
+
+import aiohttp
+import logging
+
+"""
+Автоматическое определение часового пояса по названию города.
+
+Используем:
+1) Nominatim (OpenStreetMap) для геокодинга города → lat/lon
+2) Open-Meteo Timezone API для получения смещения UTC
+"""
+
+logger = logging.getLogger(__name__)
+
+import time
+
+# In-memory TTL cache for city timezone data
+CITY_CACHE_RAM = {}  # { city_lower: {"lat": float, "lon": float, "offset": int, "updated_at": int} }
+CACHE_TTL = 86400  # 24 hours
+
+
+async def geocode_city(query: str) -> tuple[float, float, str]:
+    """
+    Определяет координаты города по текстовому запросу.
+    Сначала пробуем Nominatim (OSM),
+    затем — fallback Open-Meteo Geocoding API.
+    """
+    logger.info("Geocoding city (primary: Nominatim): %s", query)
+
+    # --- Primary: Nominatim ---
+    url_osm = "https://nominatim.openstreetmap.org/search"
+    params_osm = {
+        "q": query,
+        "format": "json",
+        "limit": 1,
+        "addressdetails": 1,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url_osm,
+                params=params_osm,
+                timeout=10,
+                headers={"User-Agent": "TelegramBot"}
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+        if data:
+            item = data[0]
+            lat = float(item["lat"])
+            lon = float(item["lon"])
+            display_name = item.get("display_name", query)
+            logger.info("City geocoded via Nominatim: %s → lat=%s lon=%s",
+                        display_name, lat, lon)
+            return lat, lon, display_name
+
+    except Exception as e:
+        logger.warning("Nominatim geocoding failed: %s", e)
+
+    # --- Fallback: Open-Meteo Geocoding ---
+    logger.info("Trying fallback geocoder (Open-Meteo) for: %s", query)
+
+    url_om = "https://geocoding-api.open-meteo.com/v1/search"
+    params_om = {"name": query, "count": 1, "language": "en"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url_om, params=params_om, timeout=10) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+        results = data.get("results")
+        if results:
+            item = results[0]
+            lat = float(item["latitude"])
+            lon = float(item["longitude"])
+            display_name = f"{item.get('name')}, {item.get('country', '')}"
+            logger.info("City geocoded via Open-Meteo: %s → lat=%s lon=%s",
+                        display_name, lat, lon)
+            return lat, lon, display_name
+
+    except Exception as e:
+        logger.error("Open-Meteo fallback geocoding failed: %s", e)
+
+    raise ValueError("Город не найден — оба геокодера не вернули результат")
+
+
+async def get_timezone_offset_minutes(lat: float, lon: float) -> int:
+    """
+    Определяет смещение UTC в минутах через Open-Meteo (новый API).
+    """
+    logger.info("Fetching timezone for lat=%s lon=%s", lat, lon)
+
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "timezone": "auto",
+        "current": "temperature_2m"
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, timeout=10) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+        if "utc_offset_seconds" not in data:
+            raise ValueError(f"No utc offset in response: {data}")
+
+        offset_seconds = data["utc_offset_seconds"]
+        offset_minutes = offset_seconds // 60
+
+        logger.info("Timezone resolved: offset_minutes=%s", offset_minutes)
+        return offset_minutes
+
+    except Exception as e:
+        logger.error("Timezone fetch failed: %s", e)
+        raise
+
+
+async def get_city_timezone(city: str, db):
+    """
+    Унифицированный метод:
+    1) Проверяет RAM-кэш
+    2) Проверяет SQLite-кэш
+    3) Делает API-запросы (геокодер + timezone)
+    4) Сохраняет результат в оба кэша
+    """
+    city_key = city.lower()
+    now = time.time()
+
+    # 1) RAM cache
+    if city_key in CITY_CACHE_RAM:
+        c = CITY_CACHE_RAM[city_key]
+        if now - c["updated_at"] < CACHE_TTL:
+            logger.info(f"[CACHE RAM] Hit for: {city}")
+            return c["lat"], c["lon"], c["offset"]
+
+    # 2) SQLite cache
+    row = await db.get_cached_city(city_key)
+    if row:
+        lat, lon, offset, ts = row
+        if now - ts < CACHE_TTL:
+            logger.info(f"[CACHE SQLite] Hit for: {city}")
+
+            CITY_CACHE_RAM[city_key] = {
+                "lat": lat,
+                "lon": lon,
+                "offset": offset,
+                "updated_at": ts,
+            }
+            return lat, lon, offset
+
+    # 3) Full API lookup
+    lat, lon, _ = await geocode_city(city)
+    offset = await get_timezone_offset_minutes(lat, lon)
+
+    # Save into caches
+    CITY_CACHE_RAM[city_key] = {
+        "lat": lat,
+        "lon": lon,
+        "offset": offset,
+        "updated_at": int(now),
+    }
+    await db.cache_city(city_key, lat, lon, offset)
+
+    logger.info(f"[CACHE WRITE] Stored cache for {city}")
+    return lat, lon, offset
+
+================================================================================
+FILE: ./bot/scheduler.py
+================================================================================
+
+from __future__ import annotations
+
+import logging
+from datetime import timezone, datetime, date, timedelta
+from typing import Dict, Any
+import asyncio
+
+import aiohttp
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiogram import Bot
+
+from bot.db import Database
+
+logger = logging.getLogger(__name__)
+
+CBR_URL = "https://www.cbr-xml-daily.ru/daily_json.js"
+
+
+async def fetch_cbr_rate(currency: str, db: Database) -> dict:
+    """
+    Получить курс валюты из ЦБ РФ с агрессивным фоллбеком.
+
+    Пытаемся получить курс из JSON сервиса за сегодня.
+    Если неудачно, пытаемся получить из архива JSON за вчера.
+    Если неудачно, пытаемся получить из XML за сегодня.
+    Если неудачно, пытаемся получить из архива XML за вчера.
+    Возвращаем словарь с ключами: rate, date, stale (bool), change_arrow (str).
+    """
+    import xml.etree.ElementTree as ET
+
+    json_url_today = "https://www.cbr-xml-daily.ru/daily_json.js"
+    xml_url_today = "https://www.cbr.ru/scripts/XML_daily.asp"
+
+    # Helper to parse date string from XML format DD.MM.YYYY to YYYY-MM-DD
+    def parse_xml_date(xml_date: str) -> str:
+        try:
+            d, m, y = xml_date.split(".")
+            return f"{y}-{m}-{d}"
+        except Exception:
+            return xml_date
+
+    async def _get_json_today() -> dict | None:
+        backoff = 1
+        for _ in range(3):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(json_url_today, timeout=10) as resp:
+                        resp.raise_for_status()
+                        data = await resp.json()
+                return data
+            except Exception as e:
+                logger.warning("Failed JSON today attempt (backoff=%ss): %s", backoff, e)
+                await asyncio.sleep(backoff)
+                backoff *= 2
+        return None
+
+    async def _get_json_archive(date_obj: date) -> dict | None:
+        date_str = date_obj.strftime("%Y/%m/%d")
+        url = f"https://www.cbr-xml-daily.ru/archive/{date_str}/daily_json.js"
+        backoff = 1
+        for _ in range(3):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=10) as resp:
+                        resp.raise_for_status()
+                        data = await resp.json()
+                return data
+            except Exception as e:
+                logger.warning("Failed JSON archive %s (backoff=%ss): %s", date_str, backoff, e)
+                await asyncio.sleep(backoff)
+                backoff *= 2
+        return None
+
+    async def _get_xml_today() -> tuple[str | None, ET.Element | None]:
+        backoff = 1
+        for _ in range(3):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(xml_url_today, timeout=10) as resp:
+                        resp.raise_for_status()
+                        xml_text = await resp.text()
+                root = ET.fromstring(xml_text)
+                xml_date = root.attrib.get("Date", None)
+                return xml_date, root
+            except Exception as e:
+                logger.warning("Failed XML today (backoff=%ss): %s", backoff, e)
+                await asyncio.sleep(backoff)
+                backoff *= 2
+        return None, None
+
+    async def _get_xml_archive(date_obj: date) -> tuple[str | None, ET.Element | None]:
+        date_str = date_obj.strftime("%d/%m/%Y")
+        url = f"https://www.cbr.ru/scripts/XML_daily.asp?date_req={date_str}"
+        backoff = 1
+        for _ in range(3):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=10) as resp:
+                        resp.raise_for_status()
+                        xml_text = await resp.text()
+                root = ET.fromstring(xml_text)
+                xml_date = root.attrib.get("Date", None)
+                return xml_date, root
+            except Exception as e:
+                logger.warning("Failed XML archive %s (backoff=%ss): %s", date_str, backoff, e)
+                await asyncio.sleep(backoff)
+                backoff *= 2
+        return None, None
+
+    def _calculate_arrow(current_rate: float, previous_rate: float) -> str:
+        if current_rate > previous_rate:
+            return "↑"
+        elif current_rate < previous_rate:
+            return "↓"
+        else:
+            return "→"
+
+    # 1) JSON today
+    data = await _get_json_today()
+    if data:
+        valute = data.get("Valute", {})
+        info = valute.get(currency.upper())
+        if info:
+            value = float(info["Value"])
+            nominal = float(info.get("Nominal", 1))
+            rate = value / nominal if nominal else value
+            raw_date = data.get("Date", "")
+            date_str = raw_date.split("T")[0] if "T" in raw_date else raw_date
+            stale = False
+
+            previous_rate = await db.get_previous_rate(currency.upper())
+            if previous_rate is None:
+                change_arrow = "→"
+            else:
+                change_arrow = _calculate_arrow(rate, previous_rate)
+
+            await db.save_rate(currency.upper(), rate, date_str)
+
+            return {
+                "rate": rate,
+                "date": date_str,
+                "stale": stale,
+                "change_arrow": change_arrow,
+            }
+
+    # 2) JSON archive (вчера)
+    yesterday = date.today() - timedelta(days=1)
+    data = await _get_json_archive(yesterday)
+    if data:
+        valute = data.get("Valute", {})
+        info = valute.get(currency.upper())
+        if info:
+            value = float(info["Value"])
+            nominal = float(info.get("Nominal", 1))
+            rate = value / nominal if nominal else value
+            raw_date = data.get("Date", "")
+            date_str = raw_date.split("T")[0] if "T" in raw_date else raw_date
+            stale = True
+
+            previous_rate = await db.get_previous_rate(currency.upper())
+            if previous_rate is None:
+                change_arrow = "→"
+            else:
+                change_arrow = _calculate_arrow(rate, previous_rate)
+
+            await db.save_rate(currency.upper(), rate, date_str)
+
+            return {
+                "rate": rate,
+                "date": date_str,
+                "stale": stale,
+                "change_arrow": change_arrow,
+            }
+
+    # 3) XML today
+    xml_date, root = await _get_xml_today()
+    if root is not None:
+        date_str = parse_xml_date(xml_date) if xml_date else ""
+        for val in root.findall("Valute"):
+            code = val.findtext("CharCode")
+            if code == currency.upper():
+                nominal = float((val.findtext("Nominal") or "1").replace(",", "."))
+                value = float((val.findtext("Value") or "0").replace(",", "."))
+                rate = value / nominal if nominal else value
+                stale = False
+
+                previous_rate = await db.get_previous_rate(currency.upper())
+                if previous_rate is None:
+                    change_arrow = "→"
+                else:
+                    change_arrow = _calculate_arrow(rate, previous_rate)
+
+                await db.save_rate(currency.upper(), rate, date_str)
+
+                return {
+                    "rate": rate,
+                    "date": date_str,
+                    "stale": stale,
+                    "change_arrow": change_arrow,
+                }
+
+    # 4) XML archive (вчера)
+    xml_date, root = await _get_xml_archive(yesterday)
+    if root is not None:
+        date_str = parse_xml_date(xml_date) if xml_date else ""
+        for val in root.findall("Valute"):
+            code = val.findtext("CharCode")
+            if code == currency.upper():
+                nominal = float((val.findtext("Nominal") or "1").replace(",", "."))
+                value = float((val.findtext("Value") or "0").replace(",", "."))
+                rate = value / nominal if nominal else value
+                stale = True
+
+                previous_rate = await db.get_previous_rate(currency.upper())
+                if previous_rate is None:
+                    change_arrow = "→"
+                else:
+                    change_arrow = _calculate_arrow(rate, previous_rate)
+
+                await db.save_rate(currency.upper(), rate, date_str)
+
+                return {
+                    "rate": rate,
+                    "date": date_str,
+                    "stale": stale,
+                    "change_arrow": change_arrow,
+                }
+
+    # If all attempts failed, raise exception
+    raise RuntimeError(
+        f"Failed to fetch CBR rate for currency {currency} with all fallbacks."
+    )
+
+
+async def send_daily_rate(bot: Bot, user_id: int, currency: str, db: Database):
+    logger.info("Sending daily rate to user_id=%s currency=%s", user_id, currency)
+    try:
+        result = await fetch_cbr_rate(currency, db)
+    except Exception:
+        logger.exception("Failed to fetch CBR rate for user_id=%s", user_id)
+        return
+
+    rate = result["rate"]
+    date_str = result["date"]
+    stale = result["stale"]
+    arrow = result["change_arrow"]
+
+    stale_text = " (данные могут быть устаревшими)" if stale else ""
+    text = (
+        f"{currency.upper()} → {rate:.2f} ₽ {arrow}\n"
+        f"Дата: {date_str}{stale_text}"
+    )
+
+    try:
+        await bot.send_message(chat_id=user_id, text=text)
+    except Exception:
+        logger.exception(
+            "Failed to send daily rate to user_id=%s currency=%s",
+            user_id,
+            currency,
+        )
+
+
+class NotificationScheduler:
+    def __init__(self, db: Database, bot: Bot):
+        self.db = db
+        self.bot = bot
+        self.scheduler = AsyncIOScheduler(timezone=timezone.utc)
+
+    async def start(self):
+        logger.info("Starting NotificationScheduler...")
+        if not self.scheduler.running:
+            self.scheduler.start()
+        await self.reload_jobs()
+
+    async def shutdown(self):
+        logger.info("Shutting down NotificationScheduler...")
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
+
+    async def reload_jobs(self):
+        logger.info("Reloading all scheduled jobs...")
+        self.scheduler.remove_all_jobs()
+        users = await self.db.get_all_with_notifications()
+        logger.debug("Users with notifications enabled: %s", users)
+        for user in users:
+            self._add_job_for_user(user)
+
+    async def reschedule_for_user(self, user_id: int):
+        logger.info("Rescheduling job for user_id=%s", user_id)
+        job_id = f"user_{user_id}"
+        try:
+            self.scheduler.remove_job(job_id)
+        except Exception:
+            pass
+
+        user = await self.db.get_user(user_id)
+        if (
+            not user
+            or not user["notification_enabled"]
+            or user["utc_hour"] is None
+            or user["utc_minute"] is None
+            or not user["currency"]
+        ):
+            return
+
+        self._add_job_for_user(user)
+
+    def _add_job_for_user(self, user: Dict[str, Any]):
+        user_id = int(user["user_id"])
+        utc_hour = int(user["utc_hour"])
+        utc_minute = int(user["utc_minute"])
+        currency = str(user["currency"]).upper()
+
+        logger.debug(
+            "Preparing to schedule job: user_id=%s utc_time=%02d:%02d currency=%s",
+            user_id,
+            utc_hour,
+            utc_minute,
+            currency,
+        )
+
+        job_id = f"user_{user_id}"
+
+        logger.info(
+            "Scheduling job for user_id=%s at %02d:%02d UTC (%s)",
+            user_id,
+            utc_hour,
+            utc_minute,
+            currency,
+        )
+
+        self.scheduler.add_job(
+            send_daily_rate,
+            "cron",
+            hour=utc_hour,
+            minute=utc_minute,
+            id=job_id,
+            replace_existing=True,
+            kwargs={
+                "bot": self.bot,
+                "db": self.db,
+                "user_id": user_id,
+                "currency": currency,
+            },
+        )
+
+================================================================================
+FILE: ./bot/states.py
+================================================================================
+
+from aiogram.fsm.state import StatesGroup, State
+
+
+class SettingsStates(StatesGroup):
+    waiting_city = State()
+    waiting_currency = State()
+    waiting_time = State()
+
+================================================================================
+FILE: ./bot/keyboards/time_picker.py
+================================================================================
+
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters.callback_data import CallbackData
+from aiogram.types import InlineKeyboardMarkup
+
+
+class TimePickerCallback(CallbackData, prefix="tp"):
+    action: str  # inc_h, dec_h, inc_m, dec_m, confirm, noop
+    hour: int
+    minute: int
+
+
+ALLOWED_MINUTES = [0, 15, 30, 45]
+
+
+def normalize_time(hour: int, minute: int) -> tuple[int, int]:
+    hour = hour % 24
+    if minute not in ALLOWED_MINUTES:
+        # привести к ближайшему из 0/15/30/45
+        closest = min(ALLOWED_MINUTES, key=lambda m: abs(m - minute))
+        minute = closest
+    return hour, minute
+
+
+def build_time_picker(hour: int, minute: int) -> InlineKeyboardMarkup:
+    hour, minute = normalize_time(hour, minute)
+
+    b = InlineKeyboardBuilder()
+
+    # Первая строка: стрелки ▲ ▲ (часы / минуты)
+    b.button(
+        text="▲",
+        callback_data=TimePickerCallback(
+            action="inc_h", hour=hour, minute=minute
+        ).pack(),
+    )
+    b.button(
+        text="▲",
+        callback_data=TimePickerCallback(
+            action="inc_m", hour=hour, minute=minute
+        ).pack(),
+    )
+
+    # Вторая строка: текущее значение часов и минут (кнопки-«плейсхолдеры»)
+    b.button(
+        text=f"{hour:02d}",
+        callback_data=TimePickerCallback(
+            action="noop", hour=hour, minute=minute
+        ).pack(),
+    )
+    b.button(
+        text=f"{minute:02d}",
+        callback_data=TimePickerCallback(
+            action="noop", hour=hour, minute=minute
+        ).pack(),
+    )
+
+    # Третья строка: стрелки ▼ ▼
+    b.button(
+        text="▼",
+        callback_data=TimePickerCallback(
+            action="dec_h", hour=hour, minute=minute
+        ).pack(),
+    )
+    b.button(
+        text="▼",
+        callback_data=TimePickerCallback(
+            action="dec_m", hour=hour, minute=minute
+        ).pack(),
+    )
+
+    # Четвёртая строка: Подтвердить
+    b.button(
+        text="Подтвердить",
+        callback_data=TimePickerCallback(
+            action="confirm", hour=hour, minute=minute
+        ).pack(),
+    )
+
+    b.adjust(2, 2, 2, 1)
+    return b.as_markup()
+
+================================================================================
+FILE: ./bot/keyboards/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./bot/keyboards/currencies.py
+================================================================================
+
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters.callback_data import CallbackData
+from aiogram.types import InlineKeyboardMarkup
+
+
+STANDARD_CURRENCIES = ["USD", "EUR", "CNY", "KZT", "TRY"]
+
+
+class CurrencyCallback(CallbackData, prefix="cur"):
+    code: str
+
+
+def get_currencies_keyboard(
+    currencies: list[str] | None = None,
+) -> InlineKeyboardMarkup:
+    if currencies is None:
+        currencies = STANDARD_CURRENCIES
+
+    builder = InlineKeyboardBuilder()
+    for code in currencies:
+        builder.button(
+            text=code,
+            callback_data=CurrencyCallback(code=code).pack(),
+        )
+    builder.adjust(3, 3)  # раскладка сеткой
+    return builder.as_markup()
+
+================================================================================
+FILE: ./bot/middlewares/logging.py
+================================================================================
+
+import logging
+from typing import Any, Awaitable, Callable, Dict
+
+from aiogram import BaseMiddleware
+from aiogram.types import TelegramObject
+
+logger = logging.getLogger(__name__)
+
+
+class LoggingMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        from_user = getattr(event, "from_user", None)
+        user_id = getattr(from_user, "id", None)
+        logger.info("Incoming update. user_id=%s, type=%s", user_id, type(event).__name__)
+        try:
+            result = await handler(event, data)
+            return result
+        except Exception:
+            logger.exception("Error while handling update for user_id=%s", user_id)
+            raise
+
+================================================================================
+FILE: ./bot/middlewares/__init__.py
+================================================================================
+
+from .logging import LoggingMiddleware
+
+__all__ = ["LoggingMiddleware"]
+
+================================================================================
+FILE: ./bot/handlers/__init__.py
+================================================================================
+
+from . import start, settings
+
+__all__ = ["start", "settings"]
+
+================================================================================
+FILE: ./bot/handlers/start.py
+================================================================================
+
+from aiogram import Router, F
+from aiogram.filters import CommandStart
+from aiogram.types import Message
+
+import logging
+logger = logging.getLogger(__name__)
+
+from aiogram.fsm.context import FSMContext
+
+from bot.db import Database
+from bot.states import SettingsStates
+from bot.utils_timezone import get_city_timezone
+from bot.keyboards.currencies import get_currencies_keyboard
+
+router = Router()
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    logger.info("User %s started /start", message.from_user.id)
+    await state.clear()
+    await message.answer(
+        "Привет! 👋\n\n"
+        "Я буду присылать курсы валют ЦБ РФ.\n"
+        "Для начала введи свой город или город и страну.\n"
+        "Например: `Москва`, `Berlin`, `New York`.",
+        parse_mode="Markdown",
+    )
+    await state.set_state(SettingsStates.waiting_city)
+
+
+@router.message(SettingsStates.waiting_city)
+async def process_timezone(
+    message: Message, state: FSMContext, db: Database
+):
+    logger.info("User %s sent city input: %s", message.from_user.id, message.text)
+
+    # Используем объединённый кэширующий метод
+    try:
+        lat, lon, offset_minutes = await get_city_timezone(message.text, db)
+    except Exception as e:
+        logger.warning(
+            "City timezone resolution failed for user_id=%s input='%s' error=%s",
+            message.from_user.id, message.text, e
+        )
+        await message.answer(
+            "Не удалось определить город или часовой пояс 😕\n"
+            "Попробуй написать иначе. Например: `Москва`, `Berlin`, `New York`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    logger.info(
+        "City resolved for user_id=%s: lat=%s lon=%s offset_minutes=%s",
+        message.from_user.id, lat, lon, offset_minutes
+    )
+
+    await db.set_timezone(message.from_user.id, offset_minutes)
+
+    await message.answer(
+        f"Город определён: *{message.text}* 🌍\n"
+        f"Часовой пояс: UTC{offset_minutes/60:+.0f} сохранён ✅\n\n"
+        "Теперь выбери валюту, по которой хочешь получать курс:",
+        parse_mode="Markdown",
+        reply_markup=get_currencies_keyboard(),
+    )
+
+    await state.set_state(SettingsStates.waiting_currency)
+
+================================================================================
+FILE: ./bot/handlers/settings.py
+================================================================================
+
+from aiogram import Router, F
+from aiogram.filters import Command
+from aiogram.types import Message, CallbackQuery
+
+from aiogram.fsm.context import FSMContext
+
+from bot.db import Database
+from bot.states import SettingsStates
+from bot.keyboards.currencies import (
+    get_currencies_keyboard,
+    CurrencyCallback,
+)
+from bot.keyboards.time_picker import (
+    build_time_picker,
+    TimePickerCallback,
+    ALLOWED_MINUTES,
+)
+from bot.scheduler import fetch_cbr_rate
+from bot.scheduler import NotificationScheduler
+
+import logging
+logger = logging.getLogger(__name__)
+
+router = Router()
+
+
+# ---------- /settings и /unsubscribe ----------
+
+
+@router.message(Command("settings"))
+async def cmd_settings(message: Message, db: Database):
+    logger.info("User %s opened /settings", message.from_user.id)
+    user = await db.get_user(message.from_user.id)
+    tz = user["timezone_utc_offset_minutes"] if user else None
+    currency = user["currency"] if user else None
+    enabled = user["notification_enabled"] if user else False
+    local_time = None
+    if user and user["local_hour"] is not None and user["local_minute"] is not None:
+        local_time = f"{user['local_hour']:02d}:{user['local_minute']:02d}"
+
+    text_lines = ["⚙️ Настройки:"]
+    text_lines.append(f"• Уведомления: {'включены ✅' if enabled else 'выключены ❌'}")
+    if tz is not None:
+        sign = "+" if tz >= 0 else "-"
+        abs_min = abs(tz)
+        h, m = divmod(abs_min, 60)
+        tz_str = f"UTC{sign}{h}"
+        if m:
+            tz_str += f":{m:02d}"
+        text_lines.append(f"• Часовой пояс: {tz_str}")
+    if currency:
+        text_lines.append(f"• Валюта: {currency}")
+    if local_time:
+        text_lines.append(f"• Время уведомлений (локальное): {local_time}")
+
+    text_lines.append("\nКоманды:")
+    text_lines.append("/start – пройти настройку заново")
+    text_lines.append("/unsubscribe – выключить уведомления")
+    text_lines.append("Чтобы изменить валюту – просто выбери её ещё раз.")
+
+    await message.answer("\n".join(text_lines))
+
+
+@router.message(Command("unsubscribe"))
+async def cmd_unsubscribe(
+    message: Message,
+    db: Database,
+    scheduler: NotificationScheduler,
+):
+    logger.info("User %s executed /unsubscribe", message.from_user.id)
+    await db.set_notifications_enabled(message.from_user.id, False)
+    await scheduler.reschedule_for_user(message.from_user.id)
+    await message.answer("Ежедневная рассылка отключена. ❌")
+
+
+# ---------- Выбор валюты ----------
+
+
+@router.callback_query(CurrencyCallback.filter())
+async def on_currency_chosen(
+    callback: CallbackQuery,
+    callback_data: CurrencyCallback,
+    state: FSMContext,
+    db: Database,
+):
+    logger.info("User %s selected currency=%s", callback.from_user.id, callback_data.code)
+    user_id = callback.from_user.id
+    logger.debug("Saving currency for user_id=%s", user_id)
+    await db.set_currency(user_id, callback_data.code)
+
+    await callback.message.edit_text(
+        f"Валюта **{callback_data.code}** сохранена ✅\n\n"
+        "Теперь выбери время ежедневного уведомления:",
+        parse_mode="Markdown",
+        reply_markup=build_time_picker(12, 0),
+    )
+    await state.set_state(SettingsStates.waiting_time)
+    await callback.answer()
+
+
+# ---------- Колесо времени ----------
+
+
+@router.callback_query(
+    TimePickerCallback.filter(F.action.in_({"inc_h", "dec_h", "inc_m", "dec_m", "noop"}))
+)
+async def on_time_adjust(
+    callback: CallbackQuery,
+    callback_data: TimePickerCallback,
+):
+    logger.debug("Time adjust action=%s hour=%s minute=%s user_id=%s",
+                 callback_data.action, callback_data.hour, callback_data.minute, callback.from_user.id)
+    hour = callback_data.hour
+    minute = callback_data.minute
+
+    if callback_data.action == "inc_h":
+        hour = (hour + 1) % 24
+    elif callback_data.action == "dec_h":
+        hour = (hour - 1) % 24
+    elif callback_data.action == "inc_m":
+        idx = ALLOWED_MINUTES.index(minute)
+        minute = ALLOWED_MINUTES[(idx + 1) % len(ALLOWED_MINUTES)]
+    elif callback_data.action == "dec_m":
+        idx = ALLOWED_MINUTES.index(minute)
+        minute = ALLOWED_MINUTES[(idx - 1) % len(ALLOWED_MINUTES)]
+    elif callback_data.action == "noop":
+        await callback.answer()
+        return
+
+    await callback.message.edit_reply_markup(
+        reply_markup=build_time_picker(hour, minute)
+    )
+    await callback.answer()
+
+
+@router.callback_query(TimePickerCallback.filter(F.action == "confirm"))
+async def on_time_confirm(
+    callback: CallbackQuery,
+    callback_data: TimePickerCallback,
+    db: Database,
+    scheduler: NotificationScheduler,
+    state: FSMContext,
+):
+    logger.info("User %s confirming time: %02d:%02d", callback.from_user.id, callback_data.hour, callback_data.minute)
+    user_id = callback.from_user.id
+    hour = callback_data.hour
+    minute = callback_data.minute
+
+    user = await db.get_user(user_id)
+    if not user or user["timezone_utc_offset_minutes"] is None:
+        await callback.answer("Сначала укажи часовой пояс через /start", show_alert=True)
+        return
+
+    offset = user["timezone_utc_offset_minutes"]
+
+    local_total = hour * 60 + minute
+    utc_total = (local_total - offset) % (24 * 60)
+    utc_hour, utc_minute = divmod(utc_total, 60)
+
+    logger.debug("Saving notification time for user_id=%s (local=%02d:%02d, utc=%02d:%02d)",
+                 user_id, hour, minute, utc_hour, utc_minute)
+    await db.set_notification_time(
+        user_id=user_id,
+        local_hour=hour,
+        local_minute=minute,
+        utc_hour=utc_hour,
+        utc_minute=utc_minute,
+        enabled=True,
+    )
+
+    await scheduler.reschedule_for_user(user_id)
+
+    await state.clear()
+
+    await callback.message.edit_text(
+        f"Готово! ✅\n\n"
+        f"Курсы будут приходить ежедневно в {hour:02d}:{minute:02d} "
+        f"(ваше локальное время)."
+    )
+    logger.info("Notification time saved for user_id=%s", user_id)
+    await callback.answer("Время сохранено")
+
+
+# ---------- /now : вручную получить курс валюты ----------
+
+@router.message(Command("now"))
+async def cmd_now(message: Message, db: Database):
+    user = await db.get_user(message.from_user.id)
+    if not user or not user.get("currency"):
+        await message.answer("Сначала настройте бота через /start (часовой пояс и валюту).")
+        return
+
+    currency = user["currency"]
+    try:
+        rate, date_str = await fetch_cbr_rate(currency)
+    except Exception:
+        logger.exception("Failed to fetch CBR rate for /now, user_id=%s", message.from_user.id)
+        await message.answer("Не удалось получить курс ЦБ РФ, попробуйте позже.")
+        return
+
+    text = f"{currency} → {rate:.2f} ₽\nДата: {date_str}"
+    await message.answer(text)
+
+
+# ---------- /debug_jobs : показать запланированные задачи APScheduler ----------
+
+@router.message(Command("debug_jobs"))
+async def cmd_debug_jobs(message: Message, scheduler: NotificationScheduler):
+    text = await scheduler.debug_jobs()
+    await message.answer(f"Текущие задачи:\n{text}")
