@@ -296,6 +296,27 @@ class Database:
             return None
         return row[0]
 
+    async def get_previous_rate(self, currency: str) -> Optional[float]:
+        """
+        Возвращает предыдущий сохранённый курс (не последний).
+        Используется для расчёта стрелочки изменения.
+        """
+        await self.connect()
+        cursor = await self._conn.execute(
+            """
+            SELECT rate FROM rates
+            WHERE currency = ?
+            ORDER BY date DESC
+            LIMIT 1 OFFSET 1
+            """,
+            (currency,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row:
+            return row[0]
+        return None
+
     async def close(self):
         if self._conn is not None:
             await self._conn.close()
